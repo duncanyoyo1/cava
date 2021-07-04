@@ -1,5 +1,6 @@
-//header file for pulse, part of cava.
+// header file for pulse, part of cava.
 
-void* input_pulse(void* data);
+#pragma once
+
+void *input_pulse(void *data);
 void getPulseDefaultSink();
-

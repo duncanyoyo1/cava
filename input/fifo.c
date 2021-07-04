@@ -1,124 +1,80 @@
-#include <unistd.h>
-#define BUFSIZE 1024
-#define MAX_FFTBUFERSIZE
-int rc;
+#include "input/fifo.h"
+#include "input/common.h"
 
-struct audio_data {
+#include <time.h>
 
-	int FFTbufferSize;
-        int16_t audio_out_r[65536];
-        int16_t audio_out_l[65536];
-        int format;
-        unsigned int rate ;
-        char *source; //alsa device, fifo path or pulse source
-        int im; //input mode alsa, fifo or pulse
-        int channels;
-	int terminate; // shared variable used to terminate audio thread
-        char error_message[1024];
-};
-
-int open_fifo(const char *path)
-{
-	int fd = open(path, O_RDONLY);
-	int flags = fcntl(fd, F_GETFL, 0);
-	fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-	return fd;
+int open_fifo(const char *path) {
+    int fd = open(path, O_RDONLY);
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    return fd;
 }
 
+// input: FIFO
+void *input_fifo(void *data) {
+    struct audio_data *audio = (struct audio_data *)data;
+    int SAMPLES_PER_BUFFER = audio->FFTtreblebufferSize * 2;
+    int bytes_per_sample = audio->format / 8;
+    __attribute__((aligned(sizeof(uint16_t)))) uint8_t buf[SAMPLES_PER_BUFFER * bytes_per_sample];
+    uint16_t *samples =
+        bytes_per_sample == 2 ? (uint16_t *)&buf : calloc(SAMPLES_PER_BUFFER, sizeof(uint16_t));
 
-//input: FIFO
-void* input_fifo(void* data)
-{
-	struct audio_data *audio = (struct audio_data *)data;
-	int fd;
-	int n = 0;
-	//signed char buf[1024];
-	//int tempr, templ, lo, q;
-	int i;
-	int t = 0;
-	//int size = 1024;
-	int bytes = 0;
-	int16_t buf[BUFSIZE / 2];
-	struct timespec req = { .tv_sec = 0, .tv_nsec = 10000000 };
+    int fd = open_fifo(audio->source);
 
+    while (!audio->terminate) {
+        int time_since_last_input = 0;
+        unsigned int offset = 0;
+        do {
+            int num_read = read(fd, buf + offset, sizeof(buf) - offset);
 
+            if (num_read < 1) { // if no bytes read sleep 10ms and zero shared buffer
+                nanosleep(&(struct timespec){.tv_sec = 0, .tv_nsec = 10000000}, NULL);
+                time_since_last_input++;
 
+                if (time_since_last_input > 10) {
+                    reset_output_buffers(audio);
+                    close(fd);
 
-	fd = open_fifo(audio->source);
+                    fd = open_fifo(audio->source);
+                    time_since_last_input = 0;
+                    offset = 0;
+                }
+            } else {
+                offset += num_read;
+                time_since_last_input = 0;
+            }
+        } while (offset < sizeof(buf));
 
-	while (1) {
-
-		bytes = read(fd, buf, sizeof(buf));
-
-		if (bytes < 1) { //if no bytes read sleep 10ms and zero shared buffer
-			nanosleep (&req, NULL);
-			t++;
-			if (t > 10) {
-				for (i = 0; i < audio->FFTbufferSize; i++)audio->audio_out_l[i] = 0;
-				for (i = 0; i < audio->FFTbufferSize; i++)audio->audio_out_r[i] = 0;
-				close(fd);
-				fd = open_fifo(audio->source);
-				t = 0;
-			}
-		} else { //if bytes read go ahead
-			t = 0;
-
-            for (i = 0; i < BUFSIZE / 2; i += 2) {
-
-                if (audio->channels == 1) audio->audio_out_l[n] = (buf[i] + buf[i + 1]) / 2;
-
-                //stereo storing channels in buffer
-                if (audio->channels == 2) {
-                        audio->audio_out_l[n] = buf[i];
-                        audio->audio_out_r[n] = buf[i + 1];
-                        }
-
-                n++;
-                if (n == audio->FFTbufferSize - 1) n = 0;
+        switch (bytes_per_sample) {
+        case 2:
+            // [samples] = [buf] so there's nothing to do here.
+            break;
+        case 3:
+            for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
+                // Really, a sample is composed of buf[3i + 2] | buf[3i + 1] | buf[3i], but our FFT
+                // only takes 16-bit samples. Since we need to scale them eventually, we can just
+                // do so here by taking the top 2 bytes.
+                samples[i] = (buf[3 * i + 2] << 8) | buf[3 * i + 1];
+            }
+            break;
+        case 4:
+            for (int i = 0; i < SAMPLES_PER_BUFFER; i++) {
+                samples[i] = (buf[4 * i + 3] << 8) | buf[4 * i + 2];
+            }
+            break;
         }
 
-/*
-			for (q = 0; q < (size / 4); q++) {
+        // We worked with unsigned ints up until now to save on sign extension, but the FFT wants
+        // signed ints.
+        pthread_mutex_lock(&lock);
+        write_to_fftw_input_buffers(SAMPLES_PER_BUFFER / 2, (int16_t *)samples, audio);
+        pthread_mutex_unlock(&lock);
+    }
 
-				tempr = ( buf[ 4 * q + 3] << 2);
+    close(fd);
+    if (bytes_per_sample != 2) {
+        free(samples);
+    }
 
-				lo =  ( buf[4 * q + 2] >> 6);
-				if (lo < 0)lo = abs(lo) + 1;
-				if (tempr >= 0)tempr = tempr + lo;
-				else tempr = tempr - lo;
-
-				templ = ( buf[ 4 * q + 1] << 2);
-
-				lo =  ( buf[ 4 * q] >> 6);
-				if (lo < 0)lo = abs(lo) + 1;
-				if (templ >= 0)templ = templ + lo;
-				else templ = templ - lo;
-
-				if (audio->channels == 1) audio->audio_out_l[n] = (tempr +
-templ) /
-2;
-
-
-				//stereo storing channels in buffer
-				if (audio->channels == 2) {
-					audio->audio_out_l[n] = templ;
-					audio->audio_out_r[n] = tempr;
-					}
-
-
-
-				n++;
-				if (n == 2048 - 1)n = 0;
-			}
-*/
-		}
-
-		if (audio->terminate == 1) {
-			close(fd);
-			break;
-		}
-
-	}
-
-	return 0;
+    return 0;
 }
